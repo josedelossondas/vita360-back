@@ -4,10 +4,10 @@ from sqlalchemy import create_engine, Column, Integer, String, ForeignKey, DateT
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship, Session
 from jose import JWTError, jwt
-from passlib.context import CryptContext
 from datetime import datetime, timedelta
 from pydantic import BaseModel
 import os
+import bcrypt
 
 # CONFIG
 SECRET_KEY = "SUPER_SECRET_KEY"
@@ -16,13 +16,17 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 60
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+    connect_args={"sslmode": "require"}  # IMPORTANTE para Render Postgres
+)
+
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
 
 app = FastAPI()
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
 # MODELOS DB
@@ -33,7 +37,7 @@ class User(Base):
     name = Column(String)
     email = Column(String, unique=True)
     password = Column(String)
-    role = Column(String)  # citizen, operator, supervisor
+    role = Column(String)
 
 class Area(Base):
     __tablename__ = "areas"
@@ -73,11 +77,18 @@ def get_db():
     finally:
         db.close()
 
-def hash_password(password):
-    return pwd_context.hash(password)
+# 🔥 NUEVO HASH SIN PASSLIB
 
-def verify_password(plain, hashed):
-    return pwd_context.verify(plain, hashed)
+def hash_password(password: str):
+    salt = bcrypt.gensalt()
+    hashed = bcrypt.hashpw(password.encode("utf-8"), salt)
+    return hashed.decode("utf-8")
+
+def verify_password(plain_password: str, hashed_password: str):
+    return bcrypt.checkpw(
+        plain_password.encode("utf-8"),
+        hashed_password.encode("utf-8")
+    )
 
 def create_access_token(data: dict):
     to_encode = data.copy()
@@ -90,6 +101,8 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         user_id: int = payload.get("sub")
         user = db.query(User).filter(User.id == user_id).first()
+        if not user:
+            raise HTTPException(status_code=401, detail="Invalid token")
         return user
     except:
         raise HTTPException(status_code=401, detail="Invalid token")
@@ -131,28 +144,43 @@ class TicketCreate(BaseModel):
 
 @app.post("/register")
 def register(user: UserCreate, db: Session = Depends(get_db)):
+
+    existing = db.query(User).filter(User.email == user.email).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Email already registered")
+
     hashed = hash_password(user.password)
+
     new_user = User(
         name=user.name,
         email=user.email,
         password=hashed,
         role=user.role
     )
+
     db.add(new_user)
     db.commit()
+
     return {"message": "User created"}
 
 @app.post("/login")
 def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+
     user = db.query(User).filter(User.email == form_data.username).first()
+
     if not user or not verify_password(form_data.password, user.password):
         raise HTTPException(status_code=400, detail="Incorrect credentials")
 
     token = create_access_token({"sub": user.id})
+
     return {"access_token": token, "token_type": "bearer"}
 
 @app.post("/tickets")
-def create_ticket(ticket: TicketCreate, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def create_ticket(
+    ticket: TicketCreate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
 
     area_name, score = classify_ticket(ticket.description)
     area = db.query(Area).filter(Area.name == area_name).first()
@@ -190,16 +218,14 @@ def create_ticket(ticket: TicketCreate, current_user: User = Depends(get_current
 
 @app.get("/my-tickets")
 def my_tickets(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    tickets = db.query(Ticket).filter(Ticket.user_id == current_user.id).all()
-    return tickets
+    return db.query(Ticket).filter(Ticket.user_id == current_user.id).all()
 
 @app.get("/tickets")
 def get_tickets(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     if current_user.role not in ["operator", "supervisor"]:
         raise HTTPException(status_code=403)
 
-    tickets = db.query(Ticket).order_by(Ticket.priority_score.desc()).all()
-    return tickets
+    return db.query(Ticket).order_by(Ticket.priority_score.desc()).all()
 
 @app.patch("/tickets/{ticket_id}/status")
 def update_status(ticket_id: int, status: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -220,7 +246,8 @@ def add_evidence(ticket_id: int, image_url: str, current_user: User = Depends(ge
     db.add(evidence)
 
     ticket = db.query(Ticket).filter(Ticket.id == ticket_id).first()
-    ticket.status = "Resuelto"
+    if ticket:
+        ticket.status = "Resuelto"
 
     db.commit()
 
