@@ -1,63 +1,45 @@
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, Column, Integer, String, ForeignKey, DateTime, Text
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session
-from jose import jwt
+from sqlalchemy.orm import sessionmaker, relationship, Session
+from jose import JWTError, jwt
 from datetime import datetime, timedelta
 from pydantic import BaseModel
-from typing import Optional, List
 import os
 import bcrypt
 
-# ─── CONFIG (leer desde variables de entorno) ────────────────────────────────
-SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-key-change-in-production")
+# CONFIG
+SECRET_KEY = "SUPER_SECRET_KEY"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
 
-# FRONTEND_URL: en Render setear como variable de entorno con la URL de Vercel
-# Ej: https://vita360.vercel.app
-FRONTEND_URL = os.getenv("FRONTEND_URL", "*")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./vita360.db")
-
-# Render entrega postgres:// pero SQLAlchemy necesita postgresql://
-if DATABASE_URL.startswith("postgres://"):
-    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-
-if DATABASE_URL.startswith("sqlite"):
-    engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
-else:
-    engine = create_engine(DATABASE_URL, pool_pre_ping=True, connect_args={"sslmode": "require"})
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+    connect_args={"sslmode": "require"}  # IMPORTANTE para Render Postgres
+)
 
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
 
-app = FastAPI(title="Vita360 API")
+app = FastAPI()
 
-# ─── CORS ────────────────────────────────────────────────────────────────────
-# Si FRONTEND_URL es "*" permite todo (dev). En prod setear la URL exacta de Vercel.
-origins = ["*"] if FRONTEND_URL == "*" else [
-    FRONTEND_URL,
-    FRONTEND_URL.rstrip("/"),          # sin trailing slash
-    "http://localhost:5173",           # dev local
-    "http://localhost:3000",
-]
-
+# CORS - Permitir frontend en cualquier origen
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["*"],  # En producción: ["https://vita360.vercel.app"]
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type", "Accept"],
-    expose_headers=["*"],
-    max_age=600,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
-# ─── MODELOS DB ───────────────────────────────────────────────────────────────
+# MODELOS DB
 
 class User(Base):
     __tablename__ = "users"
@@ -65,7 +47,7 @@ class User(Base):
     name = Column(String)
     email = Column(String, unique=True)
     password = Column(String)
-    role = Column(String)  # "ciudadano" o "operador"
+    role = Column(String)
 
 class Area(Base):
     __tablename__ = "areas"
@@ -82,23 +64,22 @@ class Ticket(Base):
     urgency_level = Column(String)
     status = Column(String)
     planned_date = Column(DateTime)
-    area_id = Column(Integer, ForeignKey("areas.id"), nullable=True)
-    area_name = Column(String, nullable=True)
+    area_id = Column(Integer, ForeignKey("areas.id"))
     user_id = Column(Integer, ForeignKey("users.id"))
-    assigned_to = Column(String, nullable=True)
+    assigned_to = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 class Evidence(Base):
     __tablename__ = "evidence"
     id = Column(Integer, primary_key=True)
     ticket_id = Column(Integer, ForeignKey("tickets.id"))
-    image_url = Column(Text)           # base64 o URL — Text para soportar base64 largo
-    description = Column(Text, nullable=True)
+    image_url = Column(String)
+    description = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 Base.metadata.create_all(engine)
 
-# ─── UTILIDADES ───────────────────────────────────────────────────────────────
+# UTILIDADES
 
 def get_db():
     db = SessionLocal()
@@ -107,205 +88,249 @@ def get_db():
     finally:
         db.close()
 
-def hash_password(password: str) -> str:
-    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+# 🔥 NUEVO HASH SIN PASSLIB
 
-def verify_password(plain: str, hashed: str) -> bool:
-    return bcrypt.checkpw(plain.encode(), hashed.encode())
+def hash_password(password: str):
+    salt = bcrypt.gensalt()
+    hashed = bcrypt.hashpw(password.encode("utf-8"), salt)
+    return hashed.decode("utf-8")
 
-def create_access_token(data: dict) -> str:
-    payload = {**data, "exp": datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)}
-    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+def verify_password(plain_password: str, hashed_password: str):
+    return bcrypt.checkpw(
+        plain_password.encode("utf-8"),
+        hashed_password.encode("utf-8")
+    )
+
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        user = db.query(User).filter(User.id == payload.get("sub")).first()
+        user_id: int = payload.get("sub")
+        user = db.query(User).filter(User.id == user_id).first()
         if not user:
-            raise HTTPException(status_code=401, detail="Token inválido")
+            raise HTTPException(status_code=401, detail="Invalid token")
         return user
-    except Exception:
-        raise HTTPException(status_code=401, detail="Token inválido")
+    except:
+        raise HTTPException(status_code=401, detail="Invalid token")
 
-# ─── CLASIFICACIÓN IA ─────────────────────────────────────────────────────────
+# MOTOR DE CLASIFICACIÓN
 
-def classify_ticket(description: str):
-    d = description.lower()
-    if "arbol" in d or "árbol" in d:         return "Áreas Verdes", 90
-    if "agua" in d or "alcantarilla" in d \
-       or "inundacion" in d or "inundación" in d: return "Obras Sanitarias", 85
-    if "vereda" in d or "hoyo" in d \
-       or "bache" in d or "pavimento" in d:  return "Infraestructura", 80
-    if "luz" in d or "alumbrado" in d \
-       or "poste" in d or "foco" in d:       return "Alumbrado Público", 75
-    if "basura" in d or "contenedor" in d \
-       or "residuo" in d:                    return "Aseo", 70
+def classify_ticket(description):
+    description = description.lower()
+
+    if "árbol" in description:
+        return "Áreas Verdes", 90
+    if "basura" in description or "contenedor" in description:
+        return "Aseo", 70
+    if "vereda" in description or "hoyo" in description:
+        return "Infraestructura", 80
+
     return "Atención General", 50
 
-def calculate_urgency(score: int) -> str:
-    return "Alta" if score >= 85 else "Media" if score >= 60 else "Baja"
+def calculate_urgency(score):
+    if score >= 85:
+        return "Alta"
+    if score >= 60:
+        return "Media"
+    return "Baja"
 
-# ─── SCHEMAS ──────────────────────────────────────────────────────────────────
+# SCHEMAS
 
 class UserCreate(BaseModel):
     name: str
     email: str
     password: str
-    role: str  # "ciudadano" | "operador"
+    role: str
 
 class TicketCreate(BaseModel):
     title: str
     description: str
 
-class EvidenceCreate(BaseModel):
-    image_url: str          # base64 data URL o https://...
-    description: Optional[str] = None
-
-class AssignTicket(BaseModel):
-    assigned_to: str
-
-class UpdateStatus(BaseModel):
-    status: str
-
-# ─── ENDPOINTS ────────────────────────────────────────────────────────────────
-
-@app.get("/")
-def root():
-    return {"status": "ok", "service": "Vita360 API"}
-
-@app.get("/health")
-def health():
-    return {"status": "healthy"}
+# ENDPOINTS
 
 @app.post("/register")
 def register(user: UserCreate, db: Session = Depends(get_db)):
-    if db.query(User).filter(User.email == user.email).first():
-        raise HTTPException(status_code=400, detail="Email ya registrado")
-    if user.role not in ["ciudadano", "operador"]:
-        raise HTTPException(status_code=400, detail="Rol debe ser 'ciudadano' u 'operador'")
-    db.add(User(name=user.name, email=user.email, password=hash_password(user.password), role=user.role))
+
+    existing = db.query(User).filter(User.email == user.email).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Email already registered")
+
+    hashed = hash_password(user.password)
+
+    new_user = User(
+        name=user.name,
+        email=user.email,
+        password=hashed,
+        role=user.role
+    )
+
+    db.add(new_user)
     db.commit()
-    return {"message": "Usuario creado"}
+
+    return {"message": "User created"}
 
 @app.post("/login")
 def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+
     user = db.query(User).filter(User.email == form_data.username).first()
+
     if not user or not verify_password(form_data.password, user.password):
-        raise HTTPException(status_code=400, detail="Credenciales incorrectas")
+        raise HTTPException(status_code=400, detail="Incorrect credentials")
+
+    token = create_access_token({"sub": user.id})
+
     return {
-        "access_token": create_access_token({"sub": user.id}),
+        "access_token": token, 
         "token_type": "bearer",
         "role": user.role,
         "name": user.name,
+        "id": user.id
     }
 
-@app.get("/me")
-def me(current_user: User = Depends(get_current_user)):
-    return {"id": current_user.id, "name": current_user.name, "email": current_user.email, "role": current_user.role}
-
-# ── Ciudadano: crear ticket ───────────────────────────────────────────────────
-
 @app.post("/tickets")
-def create_ticket(ticket: TicketCreate, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def create_ticket(
+    ticket: TicketCreate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+
     area_name, score = classify_ticket(ticket.description)
     area = db.query(Area).filter(Area.name == area_name).first()
+
     if not area:
         area = Area(name=area_name, sla_hours=72)
-        db.add(area); db.commit(); db.refresh(area)
+        db.add(area)
+        db.commit()
+        db.refresh(area)
 
     urgency = calculate_urgency(score)
-    planned = datetime.utcnow() + timedelta(hours=area.sla_hours)
+    planned_date = datetime.utcnow() + timedelta(hours=area.sla_hours)
 
-    t = Ticket(
-        title=ticket.title, description=ticket.description,
-        priority_score=score, urgency_level=urgency,
-        status="Recibido", planned_date=planned,
-        area_id=area.id, area_name=area.name, user_id=current_user.id
+    new_ticket = Ticket(
+        title=ticket.title,
+        description=ticket.description,
+        priority_score=score,
+        urgency_level=urgency,
+        status="Recibido",
+        planned_date=planned_date,
+        area_id=area.id,
+        user_id=current_user.id
     )
-    db.add(t); db.commit(); db.refresh(t)
-    return {"ticket_id": t.id, "area": area.name, "priority": urgency, "planned_date": planned, "status": t.status}
 
-# ── Ciudadano: ver sus tickets ────────────────────────────────────────────────
+    db.add(new_ticket)
+    db.commit()
+    db.refresh(new_ticket)
+
+    return {
+        "ticket_id": new_ticket.id,
+        "area": area.name,
+        "priority": urgency,
+        "planned_date": planned_date
+    }
 
 @app.get("/my-tickets")
 def my_tickets(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    tickets = db.query(Ticket).filter(Ticket.user_id == current_user.id).order_by(Ticket.created_at.desc()).all()
-    return [
-        {
-            "id": t.id, "title": t.title, "description": t.description,
-            "status": t.status, "urgency_level": t.urgency_level, "area_name": t.area_name,
-            "assigned_to": t.assigned_to, "planned_date": t.planned_date, "created_at": t.created_at,
+    tickets = db.query(Ticket).filter(Ticket.user_id == current_user.id).all()
+    
+    result = []
+    for ticket in tickets:
+        area = db.query(Area).filter(Area.id == ticket.area_id).first()
+        assigned_user = db.query(User).filter(User.id == ticket.assigned_to).first() if ticket.assigned_to else None
+        evidences = db.query(Evidence).filter(Evidence.ticket_id == ticket.id).all()
+        
+        result.append({
+            "id": ticket.id,
+            "title": ticket.title,
+            "description": ticket.description,
+            "status": ticket.status,
+            "urgency_level": ticket.urgency_level,
+            "area_name": area.name if area else "Sin asignar",
+            "assigned_to": assigned_user.name if assigned_user else None,
+            "created_at": ticket.created_at,
+            "planned_date": ticket.planned_date,
             "evidences": [
-                {"image_url": e.image_url, "description": e.description, "created_at": e.created_at}
-                for e in db.query(Evidence).filter(Evidence.ticket_id == t.id).all()
-            ],
-        }
-        for t in tickets
-    ]
-
-# ── Ciudadano: subir evidencia/foto ──────────────────────────────────────────
-
-@app.post("/tickets/{ticket_id}/evidence")
-def add_evidence(ticket_id: int, evidence: EvidenceCreate, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    ticket = db.query(Ticket).filter(Ticket.id == ticket_id).first()
-    if not ticket:
-        raise HTTPException(status_code=404, detail="Ticket no encontrado")
-    if ticket.user_id != current_user.id and current_user.role not in ["operador", "operator", "supervisor"]:
-        raise HTTPException(status_code=403, detail="Sin permisos")
-    db.add(Evidence(ticket_id=ticket_id, image_url=evidence.image_url, description=evidence.description))
-    db.commit()
-    return {"message": "Evidencia agregada"}
-
-# ── Operador: ver todos los tickets ──────────────────────────────────────────
+                {
+                    "image_url": ev.image_url,
+                    "description": getattr(ev, "description", ""),
+                    "created_at": ev.created_at
+                }
+                for ev in evidences
+            ]
+        })
+    
+    return result
 
 @app.get("/tickets")
 def get_tickets(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     if current_user.role not in ["operador", "operator", "supervisor"]:
-        raise HTTPException(status_code=403, detail="Sin permisos")
+        raise HTTPException(status_code=403, detail="Solo operadores pueden acceder")
+
     tickets = db.query(Ticket).order_by(Ticket.priority_score.desc()).all()
-    return [
-        {
-            "id": t.id, "title": t.title, "description": t.description,
-            "status": t.status, "urgency_level": t.urgency_level, "priority_score": t.priority_score,
-            "area_name": t.area_name, "assigned_to": t.assigned_to,
-            "planned_date": t.planned_date, "created_at": t.created_at,
-            "reported_by": (u := db.query(User).filter(User.id == t.user_id).first()) and u.name or "Desconocido",
-            "reported_by_email": u.email if u else "",
-            "evidences": [
-                {"image_url": e.image_url, "description": e.description, "created_at": e.created_at}
-                for e in db.query(Evidence).filter(Evidence.ticket_id == t.id).all()
-            ],
-        }
-        for t in tickets
-    ]
+    
+    result = []
+    for ticket in tickets:
+        area = db.query(Area).filter(Area.id == ticket.area_id).first()
+        assigned_user = db.query(User).filter(User.id == ticket.assigned_to).first() if ticket.assigned_to else None
+        
+        result.append({
+            "id": ticket.id,
+            "title": ticket.title,
+            "description": ticket.description,
+            "status": ticket.status,
+            "urgency_level": ticket.urgency_level,
+            "area_name": area.name if area else "Sin asignar",
+            "assigned_to": assigned_user.name if assigned_user else None,
+            "created_at": ticket.created_at,
+            "planned_date": ticket.planned_date,
+        })
+    
+    return result
 
-# ── Operador: asignar equipo ──────────────────────────────────────────────────
-
-@app.patch("/tickets/{ticket_id}/assign")
-def assign_ticket(ticket_id: int, body: AssignTicket, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    if current_user.role not in ["operador", "operator", "supervisor"]:
-        raise HTTPException(status_code=403, detail="Sin permisos")
-    ticket = db.query(Ticket).filter(Ticket.id == ticket_id).first()
-    if not ticket:
-        raise HTTPException(status_code=404, detail="Ticket no encontrado")
-    ticket.assigned_to = body.assigned_to
-    if ticket.status == "Recibido":
-        ticket.status = "Asignado"
-    db.commit()
-    return {"message": "Equipo asignado", "status": ticket.status}
-
-# ── Operador: cambiar estado ──────────────────────────────────────────────────
+class UpdateStatusRequest(BaseModel):
+    status: str
 
 @app.patch("/tickets/{ticket_id}/status")
-def update_status(ticket_id: int, body: UpdateStatus, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
-    if current_user.role not in ["operador", "operator", "supervisor"]:
-        raise HTTPException(status_code=403, detail="Sin permisos")
+def update_status(
+    ticket_id: int, 
+    request: UpdateStatusRequest,
+    current_user: User = Depends(get_current_user), 
+    db: Session = Depends(get_db)
+):
     ticket = db.query(Ticket).filter(Ticket.id == ticket_id).first()
     if not ticket:
-        raise HTTPException(status_code=404, detail="Ticket no encontrado")
-    VALID = ["Recibido", "Asignado", "En Gestión", "Resuelto", "Cerrado"]
-    if body.status not in VALID:
-        raise HTTPException(status_code=400, detail=f"Estado inválido. Opciones: {VALID}")
-    ticket.status = body.status
+        raise HTTPException(status_code=404, detail="Ticket not found")
+
+    ticket.status = request.status
     db.commit()
-    return {"message": "Estado actualizado", "status": ticket.status}
+
+    return {"message": "Status updated", "new_status": request.status}
+
+class AddEvidenceRequest(BaseModel):
+    image_url: str
+    description: str = ""
+
+@app.post("/tickets/{ticket_id}/evidence")
+def add_evidence(
+    ticket_id: int, 
+    request: AddEvidenceRequest,
+    current_user: User = Depends(get_current_user), 
+    db: Session = Depends(get_db)
+):
+    ticket = db.query(Ticket).filter(Ticket.id == ticket_id).first()
+    if not ticket:
+        raise HTTPException(status_code=404, detail="Ticket not found")
+
+    evidence = Evidence(
+        ticket_id=ticket_id, 
+        image_url=request.image_url,
+        description=request.description
+    )
+    db.add(evidence)
+    db.commit()
+
+    return {"message": "Evidence added", "evidence_id": evidence.id}
