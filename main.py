@@ -88,7 +88,7 @@ def get_db():
     finally:
         db.close()
 
-# 🔥 NUEVO HASH SIN PASSLIB
+# 🔥 HASH SIN PASSLIB
 
 def hash_password(password: str):
     salt = bcrypt.gensalt()
@@ -101,22 +101,34 @@ def verify_password(plain_password: str, hashed_password: str):
         hashed_password.encode("utf-8")
     )
 
+# 🔥 CORREGIDO: JWT sub debe ser string
 def create_access_token(data: dict):
     to_encode = data.copy()
     expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
+# 🔥 CORREGIDO: Convertir sub a int después de decodificar
 def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        user_id: int = payload.get("sub")
+        user_id_str: str = payload.get("sub")
+        if user_id_str is None:
+            raise HTTPException(status_code=401, detail="Invalid token: missing sub")
+        
+        # Convertir el user_id de string a int
+        user_id = int(user_id_str)
+        
         user = db.query(User).filter(User.id == user_id).first()
         if not user:
-            raise HTTPException(status_code=401, detail="Invalid token")
+            raise HTTPException(status_code=401, detail="Invalid token: user not found")
         return user
-    except:
-        raise HTTPException(status_code=401, detail="Invalid token")
+    except ValueError:
+        raise HTTPException(status_code=401, detail="Invalid token: invalid user ID format")
+    except JWTError as e:
+        raise HTTPException(status_code=401, detail=f"Invalid token: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Token validation error: {str(e)}")
 
 # MOTOR DE CLASIFICACIÓN
 
@@ -174,6 +186,7 @@ def register(user: UserCreate, db: Session = Depends(get_db)):
 
     return {"message": "User created"}
 
+# 🔥 CORREGIDO: Convertir user.id a string en el token
 @app.post("/login")
 def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
 
@@ -182,7 +195,8 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
     if not user or not verify_password(form_data.password, user.password):
         raise HTTPException(status_code=400, detail="Incorrect credentials")
 
-    token = create_access_token({"sub": user.id})
+    # 🔥 IMPORTANTE: Convertir user.id a string para JWT
+    token = create_access_token({"sub": str(user.id)})
 
     return {
         "access_token": token, 
