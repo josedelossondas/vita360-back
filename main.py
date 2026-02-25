@@ -162,6 +162,9 @@ class UserCreate(BaseModel):
 class TicketCreate(BaseModel):
     title: str
     description: str
+    # Foto (máx 1) integrada a la solicitud. Puede ser URL o DataURL (base64).
+    image_url: str | None = None
+    image_description: str | None = ""
 
 # ENDPOINTS
 
@@ -240,11 +243,29 @@ def create_ticket(
     db.commit()
     db.refresh(new_ticket)
 
+    # ─── Evidencia (máx 1 por ticket) ─────────────────────────────────────────
+    evidence_id = None
+    if ticket.image_url:
+        existing_count = db.query(Evidence).filter(Evidence.ticket_id == new_ticket.id).count()
+        if existing_count >= 1:
+            raise HTTPException(status_code=400, detail="Este ticket ya tiene una foto asociada")
+
+        ev = Evidence(
+            ticket_id=new_ticket.id,
+            image_url=ticket.image_url,
+            description=(ticket.image_description or "")
+        )
+        db.add(ev)
+        db.commit()
+        db.refresh(ev)
+        evidence_id = ev.id
+
     return {
         "ticket_id": new_ticket.id,
         "area": area.name,
         "priority": urgency,
-        "planned_date": planned_date
+        "planned_date": planned_date,
+        "evidence_id": evidence_id,
     }
 
 @app.get("/my-tickets")
@@ -338,6 +359,11 @@ def add_evidence(
     ticket = db.query(Ticket).filter(Ticket.id == ticket_id).first()
     if not ticket:
         raise HTTPException(status_code=404, detail="Ticket not found")
+
+    # Máx 1 foto por ticket
+    existing_count = db.query(Evidence).filter(Evidence.ticket_id == ticket_id).count()
+    if existing_count >= 1:
+        raise HTTPException(status_code=400, detail="Este ticket ya tiene una foto asociada")
 
     evidence = Evidence(
         ticket_id=ticket_id, 
