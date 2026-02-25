@@ -311,6 +311,7 @@ def get_tickets(current_user: User = Depends(get_current_user), db: Session = De
     for ticket in tickets:
         area = db.query(Area).filter(Area.id == ticket.area_id).first()
         assigned_user = db.query(User).filter(User.id == ticket.assigned_to).first() if ticket.assigned_to else None
+        reporter = db.query(User).filter(User.id == ticket.user_id).first()
         
         result.append({
             "id": ticket.id,
@@ -320,6 +321,8 @@ def get_tickets(current_user: User = Depends(get_current_user), db: Session = De
             "urgency_level": ticket.urgency_level,
             "area_name": area.name if area else "Sin asignar",
             "assigned_to": assigned_user.name if assigned_user else None,
+            "reported_by": reporter.name if reporter else None,
+            "reported_by_email": reporter.email if reporter else None,
             "created_at": ticket.created_at,
             "planned_date": ticket.planned_date,
         })
