@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, status, WebSocket, WebSocketDisconnect
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, Column, Integer, String, ForeignKey, DateTime, Text
@@ -9,6 +9,8 @@ from datetime import datetime, timedelta
 from pydantic import BaseModel
 import os
 import bcrypt
+import asyncio
+import simulation_engine as sim
 
 # CONFIG
 SECRET_KEY = "SUPER_SECRET_KEY"
@@ -27,6 +29,35 @@ SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
 
 app = FastAPI()
+
+# ─── Start simulation engine on startup ──────────────────────────────────────
+
+@app.on_event("startup")
+async def on_startup():
+    sim.start_simulation(asyncio.get_event_loop())
+
+# ─── Fleet WebSocket ──────────────────────────────────────────────────────────
+
+@app.websocket("/ws/fleet")
+async def fleet_ws(websocket: WebSocket):
+    await websocket.accept()
+    sim.register_ws(websocket)
+    # Send current state immediately on connect
+    await websocket.send_text(__import__("json").dumps(sim.get_current_state()))
+    try:
+        while True:
+            # Keep the connection alive; actual pushes come from the simulation loop
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        sim.unregister_ws(websocket)
+
+# ─── Fleet HTTP polling fallback ──────────────────────────────────────────────
+
+@app.get("/api/fleet/state")
+def fleet_state():
+    return sim.get_current_state()
 
 # CORS - Permitir frontend en cualquier origen
 app.add_middleware(
