@@ -312,6 +312,7 @@ def get_tickets(current_user: User = Depends(get_current_user), db: Session = De
         area = db.query(Area).filter(Area.id == ticket.area_id).first()
         assigned_user = db.query(User).filter(User.id == ticket.assigned_to).first() if ticket.assigned_to else None
         reporter = db.query(User).filter(User.id == ticket.user_id).first()
+        evidences = db.query(Evidence).filter(Evidence.ticket_id == ticket.id).all()
         
         result.append({
             "id": ticket.id,
@@ -325,6 +326,14 @@ def get_tickets(current_user: User = Depends(get_current_user), db: Session = De
             "reported_by_email": reporter.email if reporter else None,
             "created_at": ticket.created_at,
             "planned_date": ticket.planned_date,
+            "evidences": [
+                {
+                    "image_url": ev.image_url,
+                    "description": getattr(ev, "description", ""),
+                    "created_at": ev.created_at
+                }
+                for ev in evidences
+            ],
         })
     
     return result
