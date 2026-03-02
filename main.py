@@ -11,6 +11,7 @@ import os
 import bcrypt
 import asyncio
 import httpx
+import json
 import simulation_engine as sim
 
 # CONFIG
@@ -23,6 +24,23 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 # IA / OpenAI (clave sólo por variable de entorno, nunca en código)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+# Pesos del modelo de prioridad multi-factor
+PRIORITY_WEIGHTS = {
+    "impacto_ciudadano": 0.35,
+    "urgencia_temporal": 0.25,
+    "riesgo_seguridad": 0.20,
+    "vulnerabilidad_poblacion": 0.10,
+    "reincidencia_probable": 0.10,
+}
+
+DEFAULT_PRIORITY_FACTORS = {
+    "impacto_ciudadano": 50,
+    "urgencia_temporal": 50,
+    "riesgo_seguridad": 50,
+    "vulnerabilidad_poblacion": 50,
+    "reincidencia_probable": 50,
+}
 
 engine = create_engine(
     DATABASE_URL,
@@ -104,6 +122,9 @@ class Ticket(Base):
     user_id = Column(Integer, ForeignKey("users.id"))
     assigned_to = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+    # Multi-factor metrics y pesos de prioridad (almacenados como JSON serializado)
+    metrics_json = Column(Text, nullable=True)
+    priority_weights = Column(Text, nullable=True)
 
 class Evidence(Base):
     __tablename__ = "evidence"
@@ -234,14 +255,14 @@ def _openai_chat(messages, max_tokens: int = 60) -> str:
     return content
 
 
-def classify_ticket_with_ai(title: str, description: str):
+def classify_ticket_with_ai(title: str, description: str) -> str:
     """
-    Clasifica área y score usando IA si OPENAI_API_KEY está configurada.
+    Clasifica el área del ticket usando IA si OPENAI_API_KEY está configurada.
     Si no hay IA disponible, usa el motor heurístico existente.
     """
     if not _openai_available():
-        area, score = classify_ticket(description)
-        return area, score
+        area, _ = classify_ticket(description)
+        return area
 
     content = _openai_chat(
         [
@@ -263,50 +284,90 @@ def classify_ticket_with_ai(title: str, description: str):
     )
 
     area_name = content.splitlines()[0].strip()
-
-    # Score inicial con otro llamado IA (o heurístico si falla)
-    try:
-        score = calculate_priority_with_ai(title, description, area_name)
-    except HTTPException:
-        # Si falla la priorización IA, al menos devolvemos área con score heurístico
-        _, score = classify_ticket(description)
-
-    return area_name, score
+    return area_name
 
 
-def calculate_priority_with_ai(title: str, description: str, area: str) -> int:
+def calculate_priority_factors_with_ai(title: str, description: str) -> dict:
     """
-    Calcula score de prioridad 0-100 usando IA si hay API key.
-    Fallback: heurístico basado en classify_ticket().
+    Calcula factores de prioridad multi-factor usando IA si OPENAI_API_KEY está configurada.
+    Devuelve un dict con cinco factores (0–100). Si la IA no está disponible o falla la llamada,
+    retorna factores por defecto (todos = 50). Si la respuesta de IA no es JSON válido, lanza 502.
     """
+    # Sin API key -> factores por defecto
     if not _openai_available():
-        _, score = classify_ticket(description)
-        return score
+        return DEFAULT_PRIORITY_FACTORS.copy()
 
-    content = _openai_chat(
-        [
-            {
-                "role": "system",
-                "content": (
-                    "Devuelve solo un número entero entre 0 y 100 que indique la prioridad del ticket "
-                    "(0 = baja, 100 = crítica). No añadas texto adicional."
-                ),
-            },
-            {
-                "role": "user",
-                "content": f"Área: {area}\nTítulo: {title}\nDescripción: {description}",
-            },
-        ],
-        max_tokens=10,
-    )
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a municipal priority evaluation engine.\n"
+                "Return ONLY valid JSON with numeric fields (0-100 integers) and no additional text."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                "Evaluate this municipal report and return:\n\n"
+                "{\n"
+                '  "impacto_ciudadano": number,\n'
+                '  "urgencia_temporal": number,\n'
+                '  "riesgo_seguridad": number,\n'
+                '  "vulnerabilidad_poblacion": number,\n'
+                '  "reincidencia_probable": number\n'
+                "}\n\n"
+                f"Title: {title}\n"
+                f"Description: {description}"
+            ),
+        },
+    ]
 
     try:
-        value = int(content.strip())
-    except ValueError:
-        raise HTTPException(status_code=502, detail=f"Prioridad no numérica devuelta por OpenAI: {content!r}")
+        raw = _openai_chat(messages, max_tokens=200)
+    except HTTPException:
+        # Fallo llamando a OpenAI (timeout, 5xx, etc.) -> factores por defecto
+        return DEFAULT_PRIORITY_FACTORS.copy()
 
-    # Clamp 0-100
-    return max(0, min(100, value))
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        # Respuesta no es JSON válido
+        raise HTTPException(status_code=502, detail="Respuesta de OpenAI no es JSON válido para factores de prioridad")
+
+    expected_keys = [
+        "impacto_ciudadano",
+        "urgencia_temporal",
+        "riesgo_seguridad",
+        "vulnerabilidad_poblacion",
+        "reincidencia_probable",
+    ]
+
+    factors: dict[str, int] = {}
+    for key in expected_keys:
+        if key not in data:
+            raise HTTPException(status_code=502, detail=f"Falta el campo '{key}' en la respuesta de OpenAI")
+        value = data[key]
+        # Aceptamos int/float/str que se pueda convertir a entero
+        try:
+            ivalue = int(value)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=502, detail=f"El campo '{key}' no es un entero válido: {value!r}")
+        if not (0 <= ivalue <= 100):
+            raise HTTPException(status_code=502, detail=f"El campo '{key}' está fuera de rango 0–100: {ivalue}")
+        factors[key] = ivalue
+
+    return factors
+
+
+def compute_priority_score_from_factors(factors: dict, weights: dict) -> int:
+    """
+    Calcula el priority_score ponderado (0–100) a partir de factores y pesos.
+    """
+    total = 0.0
+    for key, weight in weights.items():
+        total += float(factors.get(key, 0)) * float(weight)
+    score = round(total)
+    return max(0, min(100, score))
 
 # SCHEMAS
 
@@ -378,8 +439,8 @@ def create_ticket(
     db: Session = Depends(get_db)
 ):
 
-    # Clasificación de área y score usando IA si está disponible (fallback heurístico)
-    area_name, score = classify_ticket_with_ai(ticket.title, ticket.description)
+    # Clasificación de área usando IA si está disponible (fallback heurístico)
+    area_name = classify_ticket_with_ai(ticket.title, ticket.description)
     area = db.query(Area).filter(Area.name == area_name).first()
 
     if not area:
@@ -388,18 +449,27 @@ def create_ticket(
         db.commit()
         db.refresh(area)
 
-    urgency = calculate_urgency(score)
+    # Factores de prioridad multi-factor (IA o valores por defecto)
+    factors = calculate_priority_factors_with_ai(ticket.title, ticket.description)
+
+    # Cálculo de priority_score ponderado
+    priority_score = compute_priority_score_from_factors(factors, PRIORITY_WEIGHTS)
+
+    # Urgencia derivada del score final
+    urgency = calculate_urgency(priority_score)
     planned_date = datetime.utcnow() + timedelta(hours=area.sla_hours)
 
     new_ticket = Ticket(
         title=ticket.title,
         description=ticket.description,
-        priority_score=score,
+        priority_score=priority_score,
         urgency_level=urgency,
         status="Recibido",
         planned_date=planned_date,
         area_id=area.id,
-        user_id=current_user.id
+        user_id=current_user.id,
+        metrics_json=json.dumps(factors),
+        priority_weights=json.dumps(PRIORITY_WEIGHTS),
     )
 
     db.add(new_ticket)
@@ -426,7 +496,8 @@ def create_ticket(
     return {
         "ticket_id": new_ticket.id,
         "area": area.name,
-        "priority": urgency,
+        "priority": priority_score,
+        "urgency_level": urgency,
         "planned_date": planned_date,
         "evidence_id": evidence_id,
     }
@@ -561,12 +632,17 @@ def ai_classify_ticket(
     if current_user.role not in ["operador", "operator", "supervisor"]:
         raise HTTPException(status_code=403, detail="Solo operadores pueden acceder a IA de clasificación")
 
-    area, score = classify_ticket_with_ai(payload.title, payload.description)
+    # Área por IA (o heurística) + factores multi-factor para score
+    area = classify_ticket_with_ai(payload.title, payload.description)
+    factors = calculate_priority_factors_with_ai(payload.title, payload.description)
+    score = compute_priority_score_from_factors(factors, PRIORITY_WEIGHTS)
     urgency = calculate_urgency(score)
     return {
         "area": area,
         "score": score,
         "urgency": urgency,
+        "metrics": factors,
+        "weights": PRIORITY_WEIGHTS,
     }
 
 
@@ -578,10 +654,13 @@ def ai_ticket_priority(
     if current_user.role not in ["operador", "operator", "supervisor"]:
         raise HTTPException(status_code=403, detail="Solo operadores pueden acceder a IA de prioridad")
 
-    # Para coherencia, usamos IA si hay clave, si no heurístico
-    score = calculate_priority_with_ai(payload.title, payload.description, area="(desconocida)")
+    # Factores multi-factor (IA o valores por defecto) para calcular priority_score
+    factors = calculate_priority_factors_with_ai(payload.title, payload.description)
+    score = compute_priority_score_from_factors(factors, PRIORITY_WEIGHTS)
     urgency = calculate_urgency(score)
     return {
         "score": score,
         "urgency": urgency,
+        "metrics": factors,
+        "weights": PRIORITY_WEIGHTS,
     }
