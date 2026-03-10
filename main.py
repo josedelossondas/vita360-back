@@ -84,15 +84,10 @@ async def fleet_ws(websocket: WebSocket):
 def fleet_state():
     return sim.get_current_state()
 
-origins = [
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-    "https://vita360.vercel.app",
-]
-
+# CORS - Permitir frontend en cualquier origen
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["*"],  # En producción: ["https://vita360.vercel.app"]
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -745,7 +740,7 @@ def assign_squad(
     # en una v2 ideal se guardaría el current_estimated_hours en el ticket)
     if ticket.squad_name and ticket.squad_name != request.squad_name:
         old_squad = db.query(Squad).filter(Squad.name == ticket.squad_name).first()
-        if old_squad and old_squad.pending_tasks is not None and old_squad.pending_tasks > 0:
+        if old_squad and old_squad.pending_tasks > 0:
             old_squad.pending_tasks = max(0, old_squad.pending_tasks - request.estimated_hours)
 
     ticket.squad_name = request.squad_name
