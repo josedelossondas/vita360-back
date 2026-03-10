@@ -84,10 +84,14 @@ async def fleet_ws(websocket: WebSocket):
 def fleet_state():
     return sim.get_current_state()
 
-# CORS - Permitir frontend en cualquier origen
+# CORS - Permitir frontend en orígenes específicos
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # En producción: ["https://vita360.vercel.app"]
+    allow_origins=[
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "https://vita360.vercel.app"
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
