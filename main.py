@@ -55,6 +55,20 @@ Base = declarative_base()
 
 app = FastAPI()
 
+# CORS - DEBE ir ANTES de cualquier ruta para que los errores 4xx/5xx
+# también incluyan las headers Access-Control-Allow-Origin
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "https://vita360.vercel.app",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # ─── Start simulation engine on startup ──────────────────────────────────────
 
 @app.on_event("startup")
@@ -83,19 +97,6 @@ async def fleet_ws(websocket: WebSocket):
 @app.get("/api/fleet/state")
 def fleet_state():
     return sim.get_current_state()
-
-# CORS - Permitir frontend en orígenes específicos
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://localhost:5173",
-        "https://vita360.vercel.app"
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
@@ -139,6 +140,9 @@ class Ticket(Base):
     # Geolocalización
     lat = Column(Float, nullable=True)                   # ← nuevo
     lng = Column(Float, nullable=True)                   # ← nuevo
+    # Datos generados por IA de tarea
+    task_summary = Column(String, nullable=True)         # ← nuevo: descripción de la tarea
+    estimated_hours = Column(Integer, nullable=True)     # ← nuevo: horas estimadas de resolución
     # Multi-factor metrics y pesos de prioridad (almacenados como JSON serializado)
     metrics_json = Column(Text, nullable=True)
     priority_weights = Column(Text, nullable=True)
@@ -443,6 +447,7 @@ class AITicketPayload(BaseModel):
 
 class AssignSquadRequest(BaseModel):
     squad_name: str
+    estimated_hours: Optional[int] = None  # ← horas estimadas; si no viene, se lee del ticket
 
 class UpdateStatusRequest(BaseModel):
     status: str
@@ -467,6 +472,8 @@ def _serialize_ticket(ticket: Ticket, db: Session, include_reporter: bool = Fals
         "priority_score": ticket.priority_score,
         "area_name": area.name if area else "Sin asignar",
         "squad_name": ticket.squad_name,
+        "task_summary": ticket.task_summary,           # ← nuevo
+        "estimated_hours": ticket.estimated_hours,     # ← nuevo
         "assigned_to": assigned_user.name if assigned_user else None,
         "created_at": ticket.created_at,
         "planned_date": ticket.planned_date,
@@ -740,24 +747,27 @@ def assign_squad(
     if not ticket:
         raise HTTPException(status_code=404, detail="Ticket not found")
 
-    # Si ya tenía cuadrilla, restar a la anterior (usando un estimado default o el nuevo, 
-    # en una v2 ideal se guardaría el current_estimated_hours en el ticket)
+    # Resolver horas estimadas: request > ticket > default (24h)
+    hours = request.estimated_hours or ticket.estimated_hours or 24
+
+    # Si ya tenía cuadrilla distinta, restar horas a la anterior
     if ticket.squad_name and ticket.squad_name != request.squad_name:
         old_squad = db.query(Squad).filter(Squad.name == ticket.squad_name).first()
-        if old_squad and old_squad.pending_tasks > 0:
-            old_squad.pending_tasks = max(0, old_squad.pending_tasks - request.estimated_hours)
+        if old_squad and old_squad.pending_tasks and old_squad.pending_tasks > 0:
+            old_hours = ticket.estimated_hours or hours
+            old_squad.pending_tasks = max(0, old_squad.pending_tasks - old_hours)
 
     ticket.squad_name = request.squad_name
+    # Guardar las horas en el ticket para futuras reasignaciones
+    ticket.estimated_hours = hours
     if ticket.status == "Recibido":
         ticket.status = "Asignado"
 
     # Sumar horas estimadas a la nueva cuadrilla
     new_squad = db.query(Squad).filter(Squad.name == request.squad_name).first()
     if new_squad:
-        # Usamos pending_tasks como "horas pendientes acumuladas"
-        # Si pending_tasks es None (ej. BD antigua), lo inicializamos
         current_hours = new_squad.pending_tasks if new_squad.pending_tasks is not None else 0
-        new_squad.pending_tasks = current_hours + request.estimated_hours
+        new_squad.pending_tasks = current_hours + hours
 
     db.commit()
     db.refresh(ticket)
@@ -765,6 +775,7 @@ def assign_squad(
         "message": "Cuadrilla asignada",
         "squad_name": ticket.squad_name,
         "status": ticket.status,
+        "estimated_hours": hours,
     }
 
 # ─── EVIDENCIA ────────────────────────────────────────────────────────────────
@@ -985,15 +996,18 @@ class AITaskPayload(BaseModel):
     description: str
     area: str
     squad_types: List[str]   # nombres de cuadrillas disponibles en el área
+    ticket_id: Optional[int] = None  # ← nuevo: si viene, guarda los resultados en el ticket
 
 
 @app.post("/ai/tickets/task")
 def ai_ticket_task(
     payload: AITaskPayload,
     current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
     """Genera una descripción concisa de la tarea y el tiempo estimado de resolución.
-    Recibe el área clasificada y los tipos de cuadrillas disponibles como contexto."""
+    Recibe el área clasificada y los tipos de cuadrillas disponibles como contexto.
+    Si se envía ticket_id, persiste task_summary y estimated_hours en el ticket."""
 
     if current_user.role not in ["operador", "operator", "supervisor"]:
         raise HTTPException(status_code=403, detail="Solo operadores pueden acceder")
@@ -1001,47 +1015,49 @@ def ai_ticket_task(
     squad_list = ", ".join(payload.squad_types) if payload.squad_types else "cuadrilla general"
 
     if not _openai_available():
-        # Fallback determinista: resumen = primeras 10 palabras del título
         words = payload.title.split()
         summary = " ".join(words[:10]) + ("…" if len(words) > 10 else "")
-        return {"task_summary": summary, "estimated_hours": 24}
+        result = {"task_summary": summary, "estimated_hours": 24}
+    else:
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Eres un asistente municipal. Dado un reporte ciudadano y el área de gestión, "
+                    "responde SOLO con JSON válido con dos campos:\n"
+                    '{"task_summary": "<descripción de la tarea en máximo 15 palabras>", "estimated_hours": <número entero de horas>}\n'
+                    "No incluyas texto adicional fuera del JSON."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Área: {payload.area}\n"
+                    f"Cuadrillas disponibles: {squad_list}\n"
+                    f"Título del reporte: {payload.title}\n"
+                    f"Descripción: {payload.description}\n\n"
+                    "Devuelve JSON con task_summary (acción concreta para la cuadrilla) y estimated_hours."
+                ),
+            },
+        ]
 
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "Eres un asistente municipal. Dado un reporte ciudadano y el área de gestión, "
-                "responde SOLO con JSON válido con dos campos:\n"
-                '{"task_summary": "<descripción de la tarea en máximo 15 palabras>", "estimated_hours": <número entero de horas>}\n'
-                "No incluyas texto adicional fuera del JSON."
-            ),
-        },
-        {
-            "role": "user",
-            "content": (
-                f"Área: {payload.area}\n"
-                f"Cuadrillas disponibles: {squad_list}\n"
-                f"Título del reporte: {payload.title}\n"
-                f"Descripción: {payload.description}\n\n"
-                "Devuelve JSON con task_summary (acción concreta para la cuadrilla) y estimated_hours."
-            ),
-        },
-    ]
+        try:
+            raw = _openai_chat(messages, max_tokens=100)
+            data = json.loads(raw)
+            summary = str(data.get("task_summary", payload.title[:60]))
+            hours = int(data.get("estimated_hours", 24))
+            result = {"task_summary": summary, "estimated_hours": max(1, min(hours, 720))}
+        except (HTTPException, json.JSONDecodeError, ValueError):
+            words = payload.title.split()
+            summary = " ".join(words[:10]) + ("…" if len(words) > 10 else "")
+            result = {"task_summary": summary, "estimated_hours": 24}
 
-    try:
-        raw = _openai_chat(messages, max_tokens=100)
-    except HTTPException:
-        words = payload.title.split()
-        summary = " ".join(words[:10]) + ("…" if len(words) > 10 else "")
-        return {"task_summary": summary, "estimated_hours": 24}
+    # ── Persistir en el ticket si se envió ticket_id ──────────────────────
+    if payload.ticket_id:
+        ticket = db.query(Ticket).filter(Ticket.id == payload.ticket_id).first()
+        if ticket:
+            ticket.task_summary = result["task_summary"]
+            ticket.estimated_hours = result["estimated_hours"]
+            db.commit()
 
-    try:
-        data = json.loads(raw)
-        summary = str(data.get("task_summary", payload.title[:60]))
-        hours = int(data.get("estimated_hours", 24))
-        return {"task_summary": summary, "estimated_hours": max(1, min(hours, 720))}
-    except (json.JSONDecodeError, ValueError):
-        words = payload.title.split()
-        summary = " ".join(words[:10]) + ("…" if len(words) > 10 else "")
-        return {"task_summary": summary, "estimated_hours": 24}
-
+    return result
