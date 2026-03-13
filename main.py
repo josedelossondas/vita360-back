@@ -122,6 +122,7 @@ class Squad(Base):
     name = Column(String)
     area_name = Column(String, nullable=True)
     pending_tasks = Column(Integer, default=0)
+    squad_type = Column(String, default="cuadrilla", nullable=True)
 
 class Ticket(Base):
     __tablename__ = "tickets"
@@ -860,8 +861,8 @@ def get_squads(
             "id": s.id,
             "name": s.name,
             "area_name": s.area_name,
-            # Normalizamos nulos a 0 para el frontend
             "pending_tasks": s.pending_tasks if s.pending_tasks is not None else 0,
+            "squad_type": s.squad_type or "cuadrilla",
         }
         for s in squads
     ]
@@ -1061,3 +1062,147 @@ def ai_ticket_task(
             db.commit()
 
     return result
+
+
+# ─── SQUAD TYPE MANAGEMENT ────────────────────────────────────────────────────
+
+class SquadTypeUpdate(BaseModel):
+    squad_type: str  # "patrulla" | "cuadrilla"
+
+@app.patch("/squads/{squad_id}/type")
+def update_squad_type(
+    squad_id: int,
+    body: SquadTypeUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    if current_user.role not in ["operador", "operator", "supervisor"]:
+        raise HTTPException(status_code=403, detail="Solo operadores pueden modificar cuadrillas")
+    squad = db.query(Squad).filter(Squad.id == squad_id).first()
+    if not squad:
+        raise HTTPException(status_code=404, detail="Cuadrilla no encontrada")
+    squad.squad_type = body.squad_type
+    db.commit()
+    return {"id": squad.id, "name": squad.name, "squad_type": squad.squad_type}
+
+
+# ─── VIT CHAT (contextualised by role) ────────────────────────────────────────
+
+class VITChatRequest(BaseModel):
+    message: str
+    history: Optional[List[dict]] = []  # [{role: user|assistant, content: str}]
+    squad_name: Optional[str] = None    # for jefe_cuadrilla
+
+@app.post("/vit/chat")
+def vit_chat(
+    body: VITChatRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Contextualised VIT chat for operators, patrol squads and regular squads."""
+
+    role = current_user.role  # operador | jefe_cuadrilla
+
+    # ── Build context from DB ─────────────────────────────────────────────────
+    tickets_ctx = ""
+    squad_ctx = ""
+
+    if role in ["operador", "operator", "supervisor"]:
+        # Admin gets a summary of all open tickets
+        open_tickets = db.query(Ticket).filter(
+            Ticket.status.notin_(["Resuelto", "Cerrado"])
+        ).order_by(Ticket.priority_score.desc()).limit(20).all()
+
+        if open_tickets:
+            lines = []
+            for t in open_tickets:
+                area = db.query(Area).filter(Area.id == t.area_id).first()
+                lines.append(
+                    f"- #{t.id} [{t.urgency_level}] {t.title} | Área: {area.name if area else '?'} "
+                    f"| Estado: {t.status} | Score: {t.priority_score}"
+                )
+            tickets_ctx = "TICKETS ABIERTOS (ordenados por prioridad):\n" + "\n".join(lines)
+
+        system_prompt = (
+            "Eres VIT, el asistente de gestión municipal de Vitacura para el equipo administrador. "
+            "Ayudas al operador a gestionar tickets, priorizar incidentes, asignar cuadrillas y entender el estado operativo. "
+            "Responde siempre en español, de forma concisa y útil.\n\n"
+            f"{tickets_ctx}"
+        )
+
+    elif role == "jefe_cuadrilla":
+        # Determine if this squad is a patrol
+        squad_name = body.squad_name or ""
+        squad = db.query(Squad).filter(Squad.name == squad_name).first()
+        is_patrol = squad and (squad.squad_type or "cuadrilla") == "patrulla"
+
+        # Get tickets for this squad
+        squad_tickets = db.query(Ticket).filter(
+            Ticket.squad_name == squad_name,
+            Ticket.status.notin_(["Resuelto", "Cerrado"])
+        ).order_by(Ticket.priority_score.desc()).limit(15).all()
+
+        if squad_tickets:
+            lines = []
+            for t in squad_tickets:
+                lines.append(
+                    f"- #{t.id} [{t.urgency_level}] {t.title} | Estado: {t.status} "
+                    f"| Score: {t.priority_score} | Horas est.: {t.estimated_hours or '?'}"
+                )
+            tickets_ctx = f"TICKETS ASIGNADOS A {squad_name}:\n" + "\n".join(lines)
+        else:
+            tickets_ctx = f"Sin tickets activos asignados a {squad_name}."
+
+        if is_patrol:
+            system_prompt = (
+                "Eres VIT, el asistente de patrulla municipal de Vitacura. "
+                "Apoyas a la patrulla con información de incidentes en su cuadrante, "
+                "navegación, priorización de respuesta, protocolos de seguridad y comunicación. "
+                "Puedes ayudar con rutas, procedimientos de atención, escalado de incidentes "
+                "y coordinación con otras unidades. Responde en español, de forma clara y operativa.\n\n"
+                f"Cuadrilla: {squad_name}\n"
+                f"Tipo: PATRULLA\n\n"
+                f"{tickets_ctx}"
+            )
+        else:
+            system_prompt = (
+                "Eres VIT, el asistente operativo municipal de Vitacura. "
+                "Apoyas a la cuadrilla con información sobre sus tickets asignados, "
+                "procedimientos de trabajo, materiales necesarios, estimaciones de tiempo "
+                "y cualquier duda técnica o logística sobre su área de trabajo. "
+                "Responde en español, de forma práctica y concreta.\n\n"
+                f"Cuadrilla: {squad_name}\n"
+                f"Tipo: CUADRILLA DE TRABAJO\n\n"
+                f"{tickets_ctx}"
+            )
+    else:
+        system_prompt = (
+            "Eres VIT, el asistente de la Municipalidad de Vitacura. "
+            "Responde preguntas sobre la municipalidad, trámites y servicios. "
+            "Responde en español."
+        )
+
+    # ── Call OpenAI (or fallback) ─────────────────────────────────────────────
+    if not _openai_available():
+        # Simple keyword fallback
+        msg_lower = body.message.lower()
+        if any(w in msg_lower for w in ["ticket", "solicitud", "pendiente", "incidente"]):
+            reply = f"Tengo acceso a la información de tickets. {tickets_ctx[:300] if tickets_ctx else 'No hay tickets activos en este momento.'}"
+        else:
+            reply = "Soy VIT, tu asistente municipal. ¿En qué puedo ayudarte hoy?"
+        return {"reply": reply}
+
+    messages = [{"role": "system", "content": system_prompt}]
+
+    # Add conversation history (last 10 messages)
+    for h in (body.history or [])[-10:]:
+        if h.get("role") in ["user", "assistant"] and h.get("content"):
+            messages.append({"role": h["role"], "content": h["content"]})
+
+    messages.append({"role": "user", "content": body.message})
+
+    try:
+        reply = _openai_chat(messages, max_tokens=400)
+        return {"reply": reply}
+    except Exception:
+        return {"reply": "Lo siento, no puedo responder ahora mismo. Intenta de nuevo en un momento."}
