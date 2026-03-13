@@ -59,12 +59,8 @@ app = FastAPI()
 # también incluyan las headers Access-Control-Allow-Origin
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://localhost:5173",
-        "https://vita360.vercel.app",
-    ],
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,   # must be False when allow_origins="*"
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -637,8 +633,9 @@ def get_tickets(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    if current_user.role not in ["operador", "operator", "supervisor"]:
-        raise HTTPException(status_code=403, detail="Solo operadores pueden acceder")
+    is_jefe = current_user.role == "jefe_cuadrilla"
+    if current_user.role not in ["operador", "operator", "supervisor"] and not is_jefe:
+        raise HTTPException(status_code=403, detail="Solo operadores o jefes de cuadrilla pueden acceder")
 
     query = db.query(Ticket)
     if order == "asc":
