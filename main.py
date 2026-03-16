@@ -57,10 +57,18 @@ app = FastAPI()
 
 # CORS - DEBE ir ANTES de cualquier ruta para que los errores 4xx/5xx
 # también incluyan las headers Access-Control-Allow-Origin
+# En producción (Vercel) evitamos "*" para mayor compatibilidad con navegadores,
+# preflight y futuras credenciales/cookies.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,   # must be False when allow_origins="*"
+    allow_origins=[
+        "https://vita360.vercel.app",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
