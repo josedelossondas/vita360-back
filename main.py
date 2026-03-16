@@ -864,6 +864,72 @@ def get_squads(
         for s in squads
     ]
 
+@app.get("/squads/stats")
+def get_squad_stats(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Retorna estadísticas detalladas de cada cuadrilla:
+    - Nombre
+    - Total de tareas
+    - Horas asignadas
+    - % de resolución dentro de SLA
+    """
+    squads = db.query(Squad).all()
+    stats = []
+    
+    for squad in squads:
+        # Obtener todos los tickets de esta cuadrilla
+        tickets = db.query(Ticket).filter(Ticket.squad_name == squad.name).all()
+        
+        total_tasks = len(tickets)
+        total_hours = sum(t.estimated_hours or 0 for t in tickets)
+        
+        # Calcular tickets dentro de SLA
+        completed_tickets = [t for t in tickets if t.status in ['Resuelto', 'Cerrado']]
+        on_time = 0
+        late = 0
+        
+        for ticket in completed_tickets:
+            # Obtener el área para conocer el SLA
+            area = db.query(Area).filter(Area.id == ticket.area_id).first()
+            if area and ticket.created_at:
+                # Calcular deadline de SLA
+                sla_deadline = ticket.created_at + timedelta(hours=area.sla_hours)
+                
+                # Usar planned_date como proxy de fecha de resolución
+                # (idealmente debería haber un campo resolved_at)
+                resolution_date = ticket.planned_date
+                
+                if resolution_date:
+                    if resolution_date <= sla_deadline:
+                        on_time += 1
+                    else:
+                        late += 1
+        
+        total_completed = len(completed_tickets)
+        sla_percentage = (on_time / total_completed * 100) if total_completed > 0 else 0
+        
+        stats.append({
+            "id": squad.id,
+            "name": squad.name,
+            "area_name": squad.area_name,
+            "squad_type": squad.squad_type or "cuadrilla",
+            "total_tasks": total_tasks,
+            "total_hours": round(total_hours, 1),
+            "pending_hours": squad.pending_tasks or 0,
+            "completed_tasks": total_completed,
+            "completed_on_time": on_time,
+            "completed_late": late,
+            "sla_percentage": round(sla_percentage, 1)
+        })
+    
+    # Ordenar por nombre
+    stats.sort(key=lambda x: x["name"])
+    
+    return stats
+
 # ─── ÁREAS ────────────────────────────────────────────────────────────────────
 
 @app.get("/areas")
